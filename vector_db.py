@@ -3,15 +3,9 @@ from qdrant_client.models import VectorParams, Distance, PointStruct
 
 
 class QdrantStorage:
-    def __init__(
-        self,
-        url="http://localhost:6333",
-        collection="docs",
-        dim=384
-    ):
-        self.client = QdrantClient(url, timeout=30)
+    def __init__(self, collection="docs", dim=384):
+        self.client = QdrantClient(":memory:")
         self.collection = collection
-
 
         if not self.client.collection_exists(self.collection):
             self.client.create_collection(
@@ -21,7 +15,6 @@ class QdrantStorage:
                     distance=Distance.COSINE
                 ),
             )
-
 
     def upsert(self, ids, vectors, payloads):
         points = [
@@ -38,19 +31,20 @@ class QdrantStorage:
             points=points
         )
 
-
     def search(self, query_vector, top_k=5):
-        results = self.client.search(
+        results = self.client.query_points(
             collection_name=self.collection,
-            query_vector=query_vector,
+            query=query_vector,
             limit=top_k,
             with_payload=True
         )
 
+        points = results.points if hasattr(results, "points") else results
+
         contexts = []
         sources = set()
 
-        for r in results:
+        for r in points:
             payload = r.payload or {}
 
             text = payload.get("text", "")
