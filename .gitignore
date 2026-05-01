@@ -15,3 +15,5 @@ wheels/
 __pycache__/
 qdrant_storage/
 uploads/
+.idea/
+favicon_io_original/

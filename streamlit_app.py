@@ -5,7 +5,9 @@ import json
 import os
 from pathlib import Path
 import time
+import uuid
 
+from groq import Groq
 import inngest
 import requests
 import streamlit as st
@@ -718,7 +720,10 @@ label,
 
 @st.cache_resource
 def get_inngest_client() -> inngest.Inngest:
-    return inngest.Inngest(app_id="rag_app", is_production=False)
+    return inngest.Inngest(
+        app_id="rag_app",
+        is_production=os.getenv("INNGEST_PRODUCTION", "false").lower() == "true",
+    )
 
 
 def uploads_dir() -> Path:
@@ -759,6 +764,80 @@ def format_file_size(size_bytes: int) -> str:
     if size_bytes < 1024 * 1024:
         return f"{size_bytes / 1024:.1f} KB"
     return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def use_inngest_pipeline() -> bool:
+    return os.getenv("USE_INNGEST", "false").lower() == "true"
+
+
+@st.cache_resource
+def get_direct_qdrant_store():
+    from vector_db import QdrantStorage
+
+    return QdrantStorage()
+
+
+@st.cache_resource
+def get_groq_client() -> Groq:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is missing in environment variables.")
+    return Groq(api_key=api_key)
+
+
+def query_llm_direct(prompt: str) -> str:
+    response = get_groq_client().chat.completions.create(
+        model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=256,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def ingest_pdf_direct(pdf_path: Path) -> dict:
+    from data_loader import embed_texts, load_and_chunk_pdf
+
+    chunks = load_and_chunk_pdf(str(pdf_path))
+    vectors = embed_texts(chunks)
+    source_id = pdf_path.name
+    ids = [
+        str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source_id}:{index}"))
+        for index in range(len(chunks))
+    ]
+    payloads = [
+        {"text": chunk, "source": source_id}
+        for chunk in chunks
+    ]
+    get_direct_qdrant_store().upsert(ids, vectors, payloads)
+    return {"ingested": len(chunks)}
+
+
+def query_pdf_direct(question: str, top_k: int) -> dict:
+    from data_loader import embed_query
+
+    query_vector = embed_query(question)
+    found = get_direct_qdrant_store().search(query_vector, top_k)
+    context_block = "\n\n".join(f"- {context}" for context in found["contexts"])
+    prompt = f"""
+You are a helpful AI assistant.
+
+Answer the question using ONLY the provided context.
+If the answer is not in the context, say "I don't know".
+
+Context:
+{context_block}
+
+Question:
+{question}
+
+Answer:
+"""
+    return {
+        "answer": query_llm_direct(prompt),
+        "sources": found["sources"],
+        "num_contexts": len(found["contexts"]),
+    }
 
 
 async def send_rag_ingest_event(pdf_path: Path) -> None:
@@ -875,12 +954,15 @@ with upload_col:
         if uploaded is not None:
             upload_key = f"{uploaded.name}:{uploaded.size}"
             if st.session_state.last_uploaded_key != upload_key:
-                with st.spinner(">> writing to disk... firing pipeline event..."):
+                with st.spinner(">> writing to disk... indexing document..."):
                     path = save_uploaded_pdf(uploaded)
-                    asyncio.run(send_rag_ingest_event(path))
+                    if use_inngest_pipeline():
+                        asyncio.run(send_rag_ingest_event(path))
+                    else:
+                        ingest_pdf_direct(path)
                     st.session_state.last_uploaded_key = upload_key
                     time.sleep(0.3)
-                st.success(f">> OK  {path.name} queued for vector ingestion.")
+                st.success(f">> OK  {path.name} indexed.")
                 history = uploaded_files()
             else:
                 st.info(f">> {uploaded.name} is already queued in this session.")
@@ -961,9 +1043,12 @@ with ask_col:
             submitted = st.form_submit_button("[ EXECUTE QUERY ]  ->", use_container_width=True)
 
         if submitted and question.strip():
-            with st.spinner(">> routing to inngest... awaiting llm response..."):
-                event_id = asyncio.run(send_rag_query_event(question.strip(), int(top_k or 5)))
-                output = wait_for_run_output(event_id)
+            with st.spinner(">> retrieving context... awaiting llm response..."):
+                if use_inngest_pipeline():
+                    event_id = asyncio.run(send_rag_query_event(question.strip(), int(top_k or 5)))
+                    output = wait_for_run_output(event_id)
+                else:
+                    output = query_pdf_direct(question.strip(), int(top_k or 5))
                 st.session_state.answer = output.get("answer", "")
                 st.session_state.sources = output.get("sources", [])
         elif submitted:
@@ -989,5 +1074,3 @@ with ask_col:
                 '<div class="dm-output-box">Awaiting query execution...</div>',
                 unsafe_allow_html=True,
             )
-
-
